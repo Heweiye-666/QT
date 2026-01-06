@@ -6,9 +6,10 @@
 #include <QDir>
 #include <QSqlError>
 #include <QFileInfo>
+#include <QStandardPaths>
 
-// CSV字段转义函数
-static QString escapeCSVField(const QString &field)
+              // CSV字段转义函数
+              static QString escapeCSVField(const QString &field)
 {
     QString escaped = field;
 
@@ -63,14 +64,21 @@ static QStringList parseCSVLine(const QString &line)
 
 Database::Database()
 {
-    // 设置数据库连接名，避免冲突
-    static int connectionCount = 0;
-    QString connectionName = QString("password_db_%1").arg(connectionCount++);
+    // 获取默认数据库连接
+    db = QSqlDatabase::database(); // 使用main.cpp中已经打开的连接
 
-    db = QSqlDatabase::addDatabase("QSQLITE", connectionName);
-    QString dbPath = QDir::currentPath() + "/passwords.db";
-    db.setDatabaseName(dbPath);
-    qDebug() << "数据库路径:" << dbPath;
+    if (!db.isOpen()) {
+        qDebug() << "数据库未打开，尝试重新连接";
+        QString dbPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/passwords.db";
+        db = QSqlDatabase::addDatabase("QSQLITE");
+        db.setDatabaseName(dbPath);
+
+        if (!db.open()) {
+            qDebug() << "仍然无法打开数据库:" << db.lastError().text();
+        } else {
+            qDebug() << "数据库重新连接成功";
+        }
+    }
 }
 
 Database::~Database()
@@ -97,6 +105,11 @@ bool Database::init()
     }
 
     if (!db.isOpen()) {
+        qDebug() << "数据库未打开，尝试重新连接";
+        QString dbPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/passwords.db";
+        db = QSqlDatabase::addDatabase("QSQLITE");
+        db.setDatabaseName(dbPath);
+
         if (!db.open()) {
             qDebug() << "无法打开数据库:" << db.lastError().text();
             return false;
@@ -111,31 +124,187 @@ bool Database::createTables()
 {
     QSqlQuery query(db);
 
-    // 创建密码表，增加account字段
-    QString sql = "CREATE TABLE IF NOT EXISTS passwords ("
+    // 创建表单表
+    QString sql = "CREATE TABLE IF NOT EXISTS forms ("
                   "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                  "website TEXT NOT NULL, "
-                  "username TEXT NOT NULL, "
-                  "account TEXT, "  // 新增：账号字段
-                  "password TEXT NOT NULL, "
-                  "notes TEXT, "
+                  "name TEXT NOT NULL, "
                   "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
-                  "UNIQUE(website, username, account))";  // 修改：将account加入唯一约束
+                  "UNIQUE(name))";
 
     if (!query.exec(sql)) {
-        qDebug() << "创建表失败:" << query.lastError().text();
+        qDebug() << "创建表单表失败:" << query.lastError().text();
         return false;
     }
 
-    // 创建索引以提高搜索性能，增加账号索引
-    query.exec("CREATE INDEX IF NOT EXISTS idx_website ON passwords(website)");
-    query.exec("CREATE INDEX IF NOT EXISTS idx_username ON passwords(username)");
-    query.exec("CREATE INDEX IF NOT EXISTS idx_account ON passwords(account)");  // 新增：账号索引
+    // 创建密码表，增加account字段和form_id字段
+    sql = "CREATE TABLE IF NOT EXISTS passwords ("
+          "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+          "form_id INTEGER NOT NULL, "
+          "website TEXT NOT NULL, "
+          "username TEXT NOT NULL, "
+          "account TEXT, "  // 新增：账号字段
+          "password TEXT NOT NULL, "
+          "notes TEXT, "
+          "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+          "FOREIGN KEY(form_id) REFERENCES forms(id) ON DELETE CASCADE, "
+          "UNIQUE(form_id, website, username, account))";  // 修改：将form_id加入唯一约束
+
+    if (!query.exec(sql)) {
+        qDebug() << "创建密码表失败:" << query.lastError().text();
+        return false;
+    }
+
+    // 创建索引以提高搜索性能
+    query.exec("CREATE INDEX IF NOT EXISTS idx_passwords_form_id ON passwords(form_id)");
+    query.exec("CREATE INDEX IF NOT EXISTS idx_passwords_website ON passwords(website)");
+    query.exec("CREATE INDEX IF NOT EXISTS idx_passwords_username ON passwords(username)");
+    query.exec("CREATE INDEX IF NOT EXISTS idx_passwords_account ON passwords(account)");
+
+    // 检查是否有表单，如果没有则创建一个默认表单
+    query.exec("SELECT COUNT(*) FROM forms");
+    if (query.next() && query.value(0).toInt() == 0) {
+        query.exec("INSERT INTO forms (name) VALUES ('默认表单')");
+        qDebug() << "创建默认表单";
+    }
+
+    // 确保至少有一个表单ID为1的默认表单
+    query.exec("SELECT id FROM forms WHERE name = '默认表单'");
+    if (!query.next()) {
+        query.exec("INSERT INTO forms (name) VALUES ('默认表单')");
+    }
 
     return true;
 }
 
-bool Database::addPassword(const QString &website, const QString &username,
+// 表单相关方法
+bool Database::addForm(const QString &name)
+{
+    if (!db.isOpen()) {
+        qDebug() << "数据库未打开";
+        return false;
+    }
+
+    QSqlQuery query(db);
+    query.prepare("INSERT OR IGNORE INTO forms (name) VALUES (:name)");
+    query.bindValue(":name", name);
+
+    if (!query.exec()) {
+        qDebug() << "添加表单失败:" << query.lastError().text();
+        return false;
+    }
+
+    return query.numRowsAffected() > 0;
+}
+
+bool Database::updateForm(int id, const QString &name)
+{
+    if (!db.isOpen()) {
+        qDebug() << "数据库未打开";
+        return false;
+    }
+
+    QSqlQuery query(db);
+    query.prepare("UPDATE forms SET name = :name WHERE id = :id");
+    query.bindValue(":name", name);
+    query.bindValue(":id", id);
+
+    if (!query.exec()) {
+        qDebug() << "更新表单失败:" << query.lastError().text();
+        return false;
+    }
+
+    return query.numRowsAffected() > 0;
+}
+
+bool Database::deleteForm(int id)
+{
+    if (!db.isOpen()) {
+        qDebug() << "数据库未打开";
+        return false;
+    }
+
+    // 首先检查是否有其他表单，不能删除最后一个表单
+    QSqlQuery checkQuery(db);
+    checkQuery.exec("SELECT COUNT(*) FROM forms");
+    if (checkQuery.next() && checkQuery.value(0).toInt() <= 1) {
+        qDebug() << "不能删除最后一个表单";
+        return false;
+    }
+
+    QSqlQuery query(db);
+    query.prepare("DELETE FROM forms WHERE id = :id");
+    query.bindValue(":id", id);
+
+    if (!query.exec()) {
+        qDebug() << "删除表单失败:" << query.lastError().text();
+        return false;
+    }
+
+    return query.numRowsAffected() > 0;
+}
+
+QList<FormEntry> Database::getAllForms()
+{
+    QList<FormEntry> forms;
+
+    if (!db.isOpen()) {
+        qDebug() << "数据库未打开";
+        return forms;
+    }
+
+    QSqlQuery query(db);
+    if (!query.exec("SELECT id, name, created_at FROM forms ORDER BY name")) {
+        qDebug() << "查询表单失败:" << query.lastError().text();
+        return forms;
+    }
+
+    while (query.next()) {
+        FormEntry form;
+        form.id = query.value(0).toInt();
+        form.name = query.value(1).toString();
+        form.created_at = query.value(2).toString();
+        forms.append(form);
+    }
+
+    // 如果没有表单，创建一个默认表单
+    if (forms.isEmpty()) {
+        addForm("默认表单");
+        return getAllForms(); // 递归调用，现在应该有表单了
+    }
+
+    return forms;
+}
+
+FormEntry Database::getFormById(int id)
+{
+    FormEntry form;
+    form.id = -1;
+
+    if (!db.isOpen()) {
+        qDebug() << "数据库未打开";
+        return form;
+    }
+
+    QSqlQuery query(db);
+    query.prepare("SELECT id, name, created_at FROM forms WHERE id = :id");
+    query.bindValue(":id", id);
+
+    if (!query.exec()) {
+        qDebug() << "查询表单失败:" << query.lastError().text();
+        return form;
+    }
+
+    if (query.next()) {
+        form.id = query.value(0).toInt();
+        form.name = query.value(1).toString();
+        form.created_at = query.value(2).toString();
+    }
+
+    return form;
+}
+
+// 密码相关方法
+bool Database::addPassword(int form_id, const QString &website, const QString &username,
                            const QString &account, const QString &password,
                            const QString &notes)
 {
@@ -144,9 +313,21 @@ bool Database::addPassword(const QString &website, const QString &username,
         return false;
     }
 
+    // 如果form_id为-1，使用第一个表单
+    if (form_id <= 0) {
+        auto forms = getAllForms();
+        if (!forms.isEmpty()) {
+            form_id = forms.first().id;
+        } else {
+            qDebug() << "没有可用的表单";
+            return false;
+        }
+    }
+
     QSqlQuery query(db);
-    query.prepare("INSERT OR IGNORE INTO passwords (website, username, account, password, notes) "
-                  "VALUES (:website, :username, :account, :password, :notes)");
+    query.prepare("INSERT OR IGNORE INTO passwords (form_id, website, username, account, password, notes) "
+                  "VALUES (:form_id, :website, :username, :account, :password, :notes)");
+    query.bindValue(":form_id", form_id);
     query.bindValue(":website", website);
     query.bindValue(":username", username);
     query.bindValue(":account", account);  // 新增：绑定账号
@@ -161,7 +342,7 @@ bool Database::addPassword(const QString &website, const QString &username,
     return query.numRowsAffected() > 0;
 }
 
-bool Database::updatePassword(int id, const QString &website,
+bool Database::updatePassword(int id, int form_id, const QString &website,
                               const QString &username, const QString &account,
                               const QString &password, const QString &notes)
 {
@@ -172,21 +353,23 @@ bool Database::updatePassword(int id, const QString &website,
 
     QSqlQuery query(db);
 
-    // 首先检查新的website、username和account组合是否已存在（排除自身）
-    query.prepare("SELECT id FROM passwords WHERE website = :website AND username = :username AND account = :account AND id != :id");
+    // 首先检查新的form_id、website、username和account组合是否已存在（排除自身）
+    query.prepare("SELECT id FROM passwords WHERE form_id = :form_id AND website = :website AND username = :username AND account = :account AND id != :id");
+    query.bindValue(":form_id", form_id);
     query.bindValue(":website", website);
     query.bindValue(":username", username);
     query.bindValue(":account", account);  // 新增：账号条件
     query.bindValue(":id", id);
 
     if (query.exec() && query.next()) {
-        qDebug() << "新的网站、用户名和账号组合已存在";
+        qDebug() << "新的表单、网站、用户名和账号组合已存在";
         return false;
     }
 
     // 如果新的组合不存在，则更新记录
-    query.prepare("UPDATE passwords SET website = :website, username = :username, "
+    query.prepare("UPDATE passwords SET form_id = :form_id, website = :website, username = :username, "
                   "account = :account, password = :password, notes = :notes WHERE id = :id");
+    query.bindValue(":form_id", form_id);
     query.bindValue(":website", website);
     query.bindValue(":username", username);
     query.bindValue(":account", account);  // 新增：更新账号
@@ -240,7 +423,7 @@ bool Database::deletePasswordByWebsite(const QString &website)
     return query.numRowsAffected() > 0;
 }
 
-QList<PasswordEntry> Database::getAllPasswords()
+QList<PasswordEntry> Database::getAllPasswords(int form_id)
 {
     QList<PasswordEntry> entries;
 
@@ -250,8 +433,17 @@ QList<PasswordEntry> Database::getAllPasswords()
     }
 
     QSqlQuery query(db);
-    // 修改：包含account字段
-    if (!query.exec("SELECT id, website, username, account, password, notes FROM passwords ORDER BY website")) {
+
+    if (form_id >= 0) {
+        // 查询指定表单的密码，按照添加顺序（ID递增）排序
+        query.prepare("SELECT id, form_id, website, username, account, password, notes FROM passwords WHERE form_id = :form_id ORDER BY id ASC");
+        query.bindValue(":form_id", form_id);
+    } else {
+        // 查询所有表单的密码，按照添加顺序（ID递增）排序
+        query.prepare("SELECT id, form_id, website, username, account, password, notes FROM passwords ORDER BY id ASC");
+    }
+
+    if (!query.exec()) {
         qDebug() << "查询密码失败:" << query.lastError().text();
         return entries;
     }
@@ -259,18 +451,19 @@ QList<PasswordEntry> Database::getAllPasswords()
     while (query.next()) {
         PasswordEntry entry;
         entry.id = query.value(0).toInt();
-        entry.website = query.value(1).toString();
-        entry.username = query.value(2).toString();
-        entry.account = query.value(3).toString();  // 新增：获取账号
-        entry.password = query.value(4).toString();
-        entry.notes = query.value(5).toString();
+        entry.form_id = query.value(1).toInt();
+        entry.website = query.value(2).toString();
+        entry.username = query.value(3).toString();
+        entry.account = query.value(4).toString();  // 新增：获取账号
+        entry.password = query.value(5).toString();
+        entry.notes = query.value(6).toString();
         entries.append(entry);
     }
 
     return entries;
 }
 
-QList<PasswordEntry> Database::searchPasswords(const QString &keyword)
+QList<PasswordEntry> Database::searchPasswords(const QString &keyword, const QList<int> &form_ids)
 {
     QList<PasswordEntry> entries;
 
@@ -280,11 +473,28 @@ QList<PasswordEntry> Database::searchPasswords(const QString &keyword)
     }
 
     QSqlQuery query(db);
-    // 修改：包含account字段，并增加账号搜索
-    query.prepare("SELECT id, website, username, account, password, notes FROM passwords "
-                  "WHERE website LIKE :keyword OR username LIKE :keyword OR account LIKE :keyword OR notes LIKE :keyword "
-                  "ORDER BY website");
+
+    QString sql = "SELECT id, form_id, website, username, account, password, notes FROM passwords ";
+    QString whereClause = "WHERE (website LIKE :keyword OR username LIKE :keyword OR account LIKE :keyword OR notes LIKE :keyword) ";
+
+    if (!form_ids.isEmpty()) {
+        // 构建IN子句
+        QStringList placeholders;
+        for (int i = 0; i < form_ids.size(); ++i) {
+            placeholders.append(QString(":form_id_%1").arg(i));
+        }
+        whereClause += "AND form_id IN (" + placeholders.join(",") + ") ";
+    }
+
+    sql += whereClause + "ORDER BY id ASC";  // 修改：按照添加顺序排序
+
+    query.prepare(sql);
     query.bindValue(":keyword", "%" + keyword + "%");
+
+    // 绑定表单ID参数
+    for (int i = 0; i < form_ids.size(); ++i) {
+        query.bindValue(QString(":form_id_%1").arg(i), form_ids[i]);
+    }
 
     if (!query.exec()) {
         qDebug() << "搜索密码失败:" << query.lastError().text();
@@ -294,18 +504,19 @@ QList<PasswordEntry> Database::searchPasswords(const QString &keyword)
     while (query.next()) {
         PasswordEntry entry;
         entry.id = query.value(0).toInt();
-        entry.website = query.value(1).toString();
-        entry.username = query.value(2).toString();
-        entry.account = query.value(3).toString();  // 新增：获取账号
-        entry.password = query.value(4).toString();
-        entry.notes = query.value(5).toString();
+        entry.form_id = query.value(1).toInt();
+        entry.website = query.value(2).toString();
+        entry.username = query.value(3).toString();
+        entry.account = query.value(4).toString();  // 新增：获取账号
+        entry.password = query.value(5).toString();
+        entry.notes = query.value(6).toString();
         entries.append(entry);
     }
 
     return entries;
 }
 
-bool Database::exportToCSV(const QString &filename)
+bool Database::exportToCSV(const QString &filename, int form_id)
 {
     if (!db.isOpen()) {
         qDebug() << "数据库未打开";
@@ -326,7 +537,7 @@ bool Database::exportToCSV(const QString &filename)
     // 写入表头，增加Account列
     out << "Website,Username,Account,Password,Notes\n";
 
-    auto passwords = getAllPasswords();
+    auto passwords = getAllPasswords(form_id);
     for (const auto &pwd : passwords) {
         // 对CSV特殊字符进行转义
         QString escapedWebsite = escapeCSVField(pwd.website);
@@ -353,7 +564,7 @@ bool Database::exportToCSV(const QString &filename)
     return true;
 }
 
-bool Database::importFromCSV(const QString &filename)
+bool Database::importFromCSV(const QString &filename, int form_id)
 {
     if (!db.isOpen()) {
         qDebug() << "数据库未打开";
@@ -396,7 +607,7 @@ bool Database::importFromCSV(const QString &filename)
                 // 对账号和密码进行加密后再存储
                 QString encryptedAccount = Encryption::encrypt(account);
                 QString encryptedPassword = Encryption::encrypt(password);
-                addPassword(website, username, encryptedAccount, encryptedPassword, notes);
+                addPassword(form_id, website, username, encryptedAccount, encryptedPassword, notes);
                 importedCount++;
             }
         } else {
@@ -409,3 +620,4 @@ bool Database::importFromCSV(const QString &filename)
     qDebug() << "成功导入" << importedCount << "条记录";
     return importedCount > 0;
 }
+
