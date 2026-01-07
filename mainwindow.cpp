@@ -2,6 +2,8 @@
 #include "database.h"
 #include "encryption.h"
 #include "importexportworker.h"
+#include "formtabwidget.h"
+#include "formselectdialog.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QTableView>
@@ -28,21 +30,30 @@
 #include <QButtonGroup>
 #include <QGroupBox>
 #include <QDialogButtonBox>
+#include <QToolButton>
+#include <QStandardPaths>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent), model(new QStandardItemModel(this)),
     progressDialog(nullptr), workerThread(nullptr), worker(nullptr),
     operationInProgress(false), multiSelectMode(false),
-    lastSelectedRow(-1), isAllSelected(false)
+    lastSelectedRow(-1), isAllSelected(false),
+    currentFormId(-1)
 {
+    qDebug() << "MainWindow构造函数开始";
+
     // 先初始化数据库
     if (!Database::instance().init()) {
         QMessageBox::critical(this, "数据库错误",
                               "无法初始化数据库，程序可能无法正常工作。\n请检查SQLite驱动是否可用。");
+        // 这里不退出，尝试继续运行，但可能功能受限
+    } else {
+        qDebug() << "数据库初始化成功";
     }
 
     setupUI();
-    loadPasswords();
+    loadForms();  // 先加载表单
+    loadPasswords();  // 然后加载当前表单的密码
 }
 
 MainWindow::~MainWindow()
@@ -60,8 +71,8 @@ MainWindow::~MainWindow()
 
 void MainWindow::setupUI()
 {
-    setWindowTitle("个人密码管理器（多线程版）");
-    resize(900, 600);
+    setWindowTitle("个人密码管理器（多线程+表单）");
+    resize(1000, 700);
 
     // 中央部件
     QWidget *centralWidget = new QWidget(this);
@@ -76,6 +87,19 @@ void MainWindow::setupUI()
     searchEdit->setPlaceholderText("搜索网站、用户名...");
     searchButton = new QPushButton("搜索");
 
+    // 新增：选择表单按钮
+    selectFormsButton = new QToolButton();
+    selectFormsButton->setText("▼");  // 实心倒三角
+    selectFormsButton->setToolTip("选择搜索表单");
+    selectFormsButton->setPopupMode(QToolButton::InstantPopup);
+
+    // 创建下拉菜单
+    QMenu *formSelectMenu = new QMenu(this);
+    QAction *selectFormsAction = new QAction("选择表单...", this);
+    connect(selectFormsAction, &QAction::triggered, this, &MainWindow::onSelectFormsClicked);
+    formSelectMenu->addAction(selectFormsAction);
+    selectFormsButton->setMenu(formSelectMenu);
+
     // 连接搜索按钮的点击事件
     connect(searchButton, &QPushButton::clicked, this, &MainWindow::searchPasswords);
 
@@ -83,12 +107,25 @@ void MainWindow::setupUI()
     connect(searchEdit, &QLineEdit::returnPressed, this, &MainWindow::searchPasswords);
 
     searchLayout->addWidget(searchEdit);
+    searchLayout->addWidget(selectFormsButton);
     searchLayout->addWidget(searchButton);
     searchLayout->addStretch();
+
+    // 表单标签栏
+    formTabWidget = new FormTabWidget();
+    connect(formTabWidget, &FormTabWidget::formAdded, this, &MainWindow::onFormAdded);
+    connect(formTabWidget, &FormTabWidget::formRemoved, this, &MainWindow::onFormRemoved);
+    connect(formTabWidget, &FormTabWidget::formRenamed, this, &MainWindow::onFormRenamed);
+    connect(formTabWidget, &FormTabWidget::currentFormChanged, this, &MainWindow::onCurrentFormChanged);
+    connect(formTabWidget, &FormTabWidget::formSelectionChanged, this, &MainWindow::onFormSelectionChanged);
+
+    mainLayout->addLayout(searchLayout);
+    mainLayout->addWidget(formTabWidget);
 
     // 表格
     tableView = new QTableView();
     setupTable();
+    mainLayout->addWidget(tableView);
 
     // 按钮栏
     addButton = new QPushButton("添加密码");
@@ -145,8 +182,6 @@ void MainWindow::setupUI()
     buttonLayout2->addStretch();
 
     // 添加到主布局
-    mainLayout->addLayout(searchLayout);
-    mainLayout->addWidget(tableView);
     mainLayout->addLayout(buttonLayout1);
     mainLayout->addLayout(buttonLayout2);
 
@@ -208,15 +243,16 @@ void MainWindow::createProgressDialog()
 
 void MainWindow::setupTable()
 {
-    model->setColumnCount(8);  // 修改：增加一列，现在是8列
+    model->setColumnCount(9);  // 修改：增加一列表单ID，现在是9列
     model->setHeaderData(0, Qt::Horizontal, "ID");
     model->setHeaderData(1, Qt::Horizontal, "网站/应用");
     model->setHeaderData(2, Qt::Horizontal, "用户名");
-    model->setHeaderData(3, Qt::Horizontal, "账号");  // 新增：账号列
-    model->setHeaderData(4, Qt::Horizontal, "密码（明文）");
+    model->setHeaderData(3, Qt::Horizontal, "账号");
+    model->setHeaderData(4, Qt::Horizontal, "密码");
     model->setHeaderData(5, Qt::Horizontal, "备注");
-    model->setHeaderData(6, Qt::Horizontal, "加密账号密码");  // 合并加密的账号和密码
-    model->setHeaderData(7, Qt::Horizontal, "选择");
+    model->setHeaderData(6, Qt::Horizontal, "加密账号密码");
+    model->setHeaderData(7, Qt::Horizontal, "表单ID");
+    model->setHeaderData(8, Qt::Horizontal, "选择");
 
     tableView->setModel(model);
     tableView->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -226,15 +262,16 @@ void MainWindow::setupTable()
     // 设置列宽
     tableView->setColumnWidth(1, 150);
     tableView->setColumnWidth(2, 120);
-    tableView->setColumnWidth(3, 120);  // 新增：账号列宽
+    tableView->setColumnWidth(3, 120);
     tableView->setColumnWidth(4, 100);
     tableView->setColumnWidth(5, 200);
-    tableView->setColumnWidth(7, 60);
+    tableView->setColumnWidth(8, 60);
 
     // 隐藏列
     tableView->setColumnHidden(0, true);
     tableView->setColumnHidden(6, true);
-    tableView->setColumnHidden(7, !multiSelectMode);
+    tableView->setColumnHidden(7, true);
+    tableView->setColumnHidden(8, !multiSelectMode);
 
     // 连接信号
     connect(tableView, &QTableView::clicked, this, &MainWindow::onTableViewClicked);
@@ -299,7 +336,7 @@ void MainWindow::clearAllCheckboxes()
 {
     // 清除所有复选框的选中状态
     for (int i = 0; i < model->rowCount(); ++i) {
-        QStandardItem* checkItem = model->item(i, 7);
+        QStandardItem* checkItem = model->item(i, 8);  // 第8列是选择框
         if (checkItem) {
             checkItem->setCheckState(Qt::Unchecked);
         }
@@ -330,8 +367,8 @@ void MainWindow::onItemDoubleClicked(const QModelIndex &index)
     if (column >= 1 && column <= 5) {
         editField(row, column);
     } else {
-        // 如果点击了ID列或加密密码列，提示不可编辑
-        if (column == 0 || column == 6) {
+        // 如果点击了ID列或加密密码列或表单ID列，提示不可编辑
+        if (column == 0 || column == 6 || column == 7) {
             QMessageBox::information(this, "提示", "此列不可编辑");
         }
     }
@@ -347,6 +384,9 @@ bool MainWindow::editField(int row, int column)
     }
 
     int id = idItem->data(Qt::UserRole + 1).toInt();
+
+    // 获取表单ID
+    int form_id = model->item(row, 7)->text().toInt();
 
     // 获取当前单元格的值
     QString currentValue = model->item(row, column)->text();
@@ -450,8 +490,8 @@ bool MainWindow::editField(int row, int column)
     QString encryptedAccount = Encryption::encrypt(account);
     QString encryptedPassword = Encryption::encrypt(password);
 
-    // 更新数据库
-    if (Database::instance().updatePassword(id, website, username, encryptedAccount, encryptedPassword, notes)) {
+    // 更新数据库，传入表单ID
+    if (Database::instance().updatePassword(id, form_id, website, username, encryptedAccount, encryptedPassword, notes)) {
         // 更新模型中的数据
         model->item(row, column)->setText(newValue);
 
@@ -483,20 +523,88 @@ void MainWindow::clearSelection()
     }
 }
 
+void MainWindow::loadForms()
+{
+    qDebug() << "开始加载表单";
+
+    auto forms = Database::instance().getAllForms();
+    qDebug() << "获取到表单数量:" << forms.size();
+
+    formTabWidget->clear();  // 清空标签栏
+
+    if (forms.isEmpty()) {
+        // 如果没有表单，创建一个默认表单
+        qDebug() << "没有表单，创建默认表单";
+        if (Database::instance().addForm("默认表单")) {
+            forms = Database::instance().getAllForms();
+            qDebug() << "重新获取表单数量:" << forms.size();
+        } else {
+            qDebug() << "创建默认表单失败";
+        }
+    }
+
+    for (const auto &form : forms) {
+        qDebug() << "添加表单:" << form.id << form.name;
+        formTabWidget->addForm(form.id, form.name, currentFormId == -1 || form.id == currentFormId);
+        if (currentFormId == -1) {
+            currentFormId = form.id;
+            qDebug() << "设置当前表单ID为:" << currentFormId;
+        }
+    }
+
+    // 默认在所有表单中搜索
+    selectedFormIdsForSearch = formTabWidget->allFormIds();
+
+    // 如果当前表单ID仍然为-1，设置为第一个表单的ID
+    if (currentFormId == -1 && !forms.isEmpty()) {
+        currentFormId = forms.first().id;
+        qDebug() << "重新设置当前表单ID为第一个表单:" << currentFormId;
+    }
+
+    qDebug() << "表单加载完成，当前表单ID:" << currentFormId;
+}
+
 void MainWindow::loadPasswords()
 {
+    qDebug() << "开始加载密码，当前表单ID:" << currentFormId;
+
     // 断开之前的连接，避免重复连接
     disconnect(model, &QStandardItemModel::itemChanged, this, &MainWindow::onCheckboxStateChanged);
 
     model->removeRows(0, model->rowCount());
 
-    auto passwords = Database::instance().getAllPasswords();
+    // 检查数据库连接
+    if (!Database::instance().init()) {
+        qDebug() << "数据库初始化失败";
+        statusBar->showMessage("数据库初始化失败");
+        return;
+    }
+
+    // 如果当前表单ID为-1，尝试获取第一个表单
+    if (currentFormId == -1) {
+        auto forms = Database::instance().getAllForms();
+        if (!forms.isEmpty()) {
+            currentFormId = forms.first().id;
+            qDebug() << "设置当前表单ID为第一个表单:" << currentFormId;
+
+            // 更新标签栏当前选中项
+            formTabWidget->setCurrentForm(currentFormId);
+        } else {
+            qDebug() << "没有可用的表单";
+            statusBar->showMessage("没有可用的表单");
+            return;
+        }
+    }
+
+    auto passwords = Database::instance().getAllPasswords(currentFormId);
+    qDebug() << "获取到密码记录数量:" << passwords.size();
+
     for (const auto &pwd : passwords) {
         QList<QStandardItem*> row;
 
         // 第0列：隐藏的ID
         QStandardItem* idItem = new QStandardItem();
-        idItem->setData(pwd.id, Qt::UserRole + 1);  // 将ID存储在UserRole+1中
+        idItem->setData(pwd.id, Qt::UserRole + 1);
         row << idItem;
 
         // 第1列：网站
@@ -510,12 +618,14 @@ void MainWindow::loadPasswords()
         row << usernameItem;
 
         // 第3列：账号（解密后）
-        QStandardItem* accountItem = new QStandardItem(Encryption::decrypt(pwd.account));
+        QString decryptedAccount = Encryption::decrypt(pwd.account);
+        QStandardItem* accountItem = new QStandardItem(decryptedAccount);
         accountItem->setEditable(false);
         row << accountItem;
 
         // 第4列：密码（解密后）
-        QStandardItem* passwordItem = new QStandardItem(Encryption::decrypt(pwd.password));
+        QString decryptedPassword = Encryption::decrypt(pwd.password);
+        QStandardItem* passwordItem = new QStandardItem(decryptedPassword);
         passwordItem->setEditable(false);
         row << passwordItem;
 
@@ -529,7 +639,12 @@ void MainWindow::loadPasswords()
         encryptedItem->setEditable(false);
         row << encryptedItem;
 
-        // 第7列：选择框
+        // 第7列：表单ID
+        QStandardItem* formIdItem = new QStandardItem(QString::number(pwd.form_id));
+        formIdItem->setEditable(false);
+        row << formIdItem;
+
+        // 第8列：选择框
         QStandardItem* checkItem = new QStandardItem();
         checkItem->setCheckable(true);
         checkItem->setEditable(false);
@@ -539,7 +654,7 @@ void MainWindow::loadPasswords()
         model->appendRow(row);
     }
 
-    statusBar->showMessage(QString("加载了 %1 条记录").arg(passwords.size()));
+    statusBar->showMessage(QString("表单 '%1' 加载了 %2 条记录").arg(formTabWidget->currentFormName()).arg(passwords.size()));
 
     // 重置全选状态
     isAllSelected = false;
@@ -550,6 +665,8 @@ void MainWindow::loadPasswords()
 
     // 连接复选框状态改变信号
     connect(model, &QStandardItemModel::itemChanged, this, &MainWindow::onCheckboxStateChanged);
+
+    qDebug() << "密码加载完成";
 }
 
 void MainWindow::updateButtonStates()
@@ -574,10 +691,10 @@ void MainWindow::toggleMultiSelectMode()
 
     if (multiSelectMode) {
         multiSelectButton->setText("取消多选");
-        tableView->setColumnHidden(7, false);  // 显示选择框列
+        tableView->setColumnHidden(8, false);  // 显示选择框列
     } else {
         multiSelectButton->setText("多选");
-        tableView->setColumnHidden(7, true);   // 隐藏选择框列
+        tableView->setColumnHidden(8, true);   // 隐藏选择框列
 
         // 清除所有复选框的选择状态
         clearAllCheckboxes();
@@ -611,7 +728,7 @@ void MainWindow::selectAll()
     Qt::CheckState newState = isAllSelected ? Qt::Checked : Qt::Unchecked;
 
     for (int i = 0; i < model->rowCount(); ++i) {
-        QStandardItem* checkItem = model->item(i, 7);
+        QStandardItem* checkItem = model->item(i, 8);  // 第8列是选择框
         if (checkItem) {
             checkItem->setCheckState(newState);
         }
@@ -637,7 +754,7 @@ void MainWindow::onCheckboxStateChanged()
     // 计算当前选中数量
     int selectedCount = 0;
     for (int i = 0; i < model->rowCount(); ++i) {
-        QStandardItem* checkItem = model->item(i, 7);
+        QStandardItem* checkItem = model->item(i, 8);  // 第8列是选择框
         if (checkItem && checkItem->checkState() == Qt::Checked) {
             selectedCount++;
         }
@@ -656,8 +773,27 @@ void MainWindow::onCheckboxStateChanged()
 
 void MainWindow::addPassword()
 {
+    qDebug() << "开始添加密码，当前表单ID:" << currentFormId;
+
     // 清除当前选中状态
     clearSelection();
+
+    if (currentFormId == -1) {
+        qDebug() << "当前表单ID为-1，尝试创建默认表单";
+        QMessageBox::warning(this, "警告", "没有可用表单，正在创建默认表单...");
+
+        // 尝试创建默认表单
+        if (Database::instance().addForm("默认表单")) {
+            loadForms(); // 重新加载表单
+            if (currentFormId == -1) {
+                QMessageBox::critical(this, "错误", "创建默认表单失败，无法添加密码");
+                return;
+            }
+        } else {
+            QMessageBox::critical(this, "错误", "无法创建表单，请检查数据库连接");
+            return;
+        }
+    }
 
     // 简单对话框添加
     bool ok;
@@ -719,11 +855,16 @@ void MainWindow::addPassword()
     QString encryptedAccount = Encryption::encrypt(account);
     QString encryptedPassword = Encryption::encrypt(password);
 
-    if (Database::instance().addPassword(website, username, encryptedAccount, encryptedPassword, notes)) {
+    qDebug() << "准备添加密码到数据库，表单ID:" << currentFormId;
+    qDebug() << "网站:" << website << "用户名:" << username << "账号:" << account;
+
+    if (Database::instance().addPassword(currentFormId, website, username, encryptedAccount, encryptedPassword, notes)) {
         loadPasswords();
         statusBar->showMessage("密码添加成功");
+        QMessageBox::information(this, "成功", "密码添加成功!");
     } else {
         statusBar->showMessage("密码添加失败，可能已存在相同记录");
+        QMessageBox::warning(this, "失败", "密码添加失败，可能已存在相同记录!");
     }
 }
 
@@ -737,6 +878,9 @@ void MainWindow::editSelectedRow(int row)
     }
 
     int id = idItem->data(Qt::UserRole + 1).toInt();
+
+    // 获取表单ID
+    int form_id = model->item(row, 7)->text().toInt();
 
     bool ok;
     QString website = QInputDialog::getText(this, "编辑密码", "网站/应用:",
@@ -755,7 +899,7 @@ void MainWindow::editSelectedRow(int row)
 
     // 账号输入 - 循环验证
     QString account;
-    QString accountTemp = Encryption::decrypt(model->item(row, 3)->text());
+    QString accountTemp = model->item(row, 3)->text();
     while (true) {
         account = QInputDialog::getText(this, "编辑密码", "账号(6-20位):",
                                         QLineEdit::Normal, accountTemp, &ok);
@@ -800,7 +944,10 @@ void MainWindow::editSelectedRow(int row)
 
     QString newEncryptedAccount = Encryption::encrypt(account);
     QString newEncryptedPassword = Encryption::encrypt(password);
-    if (Database::instance().updatePassword(id, website, username, newEncryptedAccount, newEncryptedPassword, notes)) {
+
+    qDebug() << "准备更新密码，ID:" << id << "表单ID:" << form_id;
+
+    if (Database::instance().updatePassword(id, form_id, website, username, newEncryptedAccount, newEncryptedPassword, notes)) {
         loadPasswords();
         statusBar->showMessage("密码更新成功");
     } else {
@@ -815,7 +962,7 @@ void MainWindow::editPassword()
         // 在多选模式下，检查是否有选中的行
         QList<int> selectedRows;
         for (int i = 0; i < model->rowCount(); ++i) {
-            QStandardItem* checkItem = model->item(i, 7);
+            QStandardItem* checkItem = model->item(i, 8);  // 第8列是选择框
             if (checkItem && checkItem->checkState() == Qt::Checked) {
                 selectedRows.append(i);
             }
@@ -859,14 +1006,17 @@ void MainWindow::deletePassword()
         // 批量删除模式
         QList<int> rowsToDelete;
         QList<int> idsToDelete;
+        QList<int> formIdsToDelete;
 
         // 收集要删除的行和ID
         for (int i = 0; i < model->rowCount(); ++i) {
-            QStandardItem* checkItem = model->item(i, 7);  // 第7列是选择框
+            QStandardItem* checkItem = model->item(i, 8);  // 第8列是选择框
             if (checkItem && checkItem->checkState() == Qt::Checked) {
                 rowsToDelete.append(i);
                 int id = model->item(i, 0)->data(Qt::UserRole + 1).toInt();  // 获取ID
                 idsToDelete.append(id);
+                int form_id = model->item(i, 7)->text().toInt();  // 获取表单ID
+                formIdsToDelete.append(form_id);
             }
         }
 
@@ -956,12 +1106,11 @@ void MainWindow::deletePassword()
 void MainWindow::searchPasswords()
 {
     QString keyword = searchEdit->text().trimmed();
-    if (keyword.isEmpty()) {
-        loadPasswords();
-        return;
-    }
+    qDebug() << "开始搜索，关键词:" << keyword << "选择的表单数量:" << selectedFormIdsForSearch.size();
 
-    auto results = Database::instance().searchPasswords(keyword);
+    // 使用选中的表单ID列表进行搜索
+    auto results = Database::instance().searchPasswords(keyword, selectedFormIdsForSearch);
+    qDebug() << "搜索到记录数量:" << results.size();
 
     // 断开之前的连接，避免重复连接
     disconnect(model, &QStandardItemModel::itemChanged, this, &MainWindow::onCheckboxStateChanged);
@@ -1006,7 +1155,12 @@ void MainWindow::searchPasswords()
         encryptedItem->setEditable(false);
         row << encryptedItem;
 
-        // 第7列：选择框
+        // 第7列：表单ID
+        QStandardItem* formIdItem = new QStandardItem(QString::number(pwd.form_id));
+        formIdItem->setEditable(false);
+        row << formIdItem;
+
+        // 第8列：选择框
         QStandardItem* checkItem = new QStandardItem();
         checkItem->setCheckable(true);
         checkItem->setEditable(false);
@@ -1026,7 +1180,7 @@ void MainWindow::searchPasswords()
     // 清除选中状态
     clearSelection();
 
-    statusBar->showMessage(QString("找到 %1 条匹配记录").arg(results.size()));
+    statusBar->showMessage(QString("在 %1 个表单中找到 %2 条匹配记录").arg(selectedFormIdsForSearch.size()).arg(results.size()));
 }
 
 bool MainWindow::exportSelectedPasswords(const QString &filename)
@@ -1049,7 +1203,7 @@ bool MainWindow::exportSelectedPasswords(const QString &filename)
 
     // 按顺序导出选中的行
     for (int i = 0; i < model->rowCount(); ++i) {
-        QStandardItem* checkItem = model->item(i, 7);
+        QStandardItem* checkItem = model->item(i, 8);  // 第8列是选择框
         if (checkItem && checkItem->checkState() == Qt::Checked) {
             QString website = model->item(i, 1)->text();
             QString username = model->item(i, 2)->text();
@@ -1149,14 +1303,14 @@ void MainWindow::exportPasswords()
         // 获取选中的行
         QList<int> selectedRows;
         for (int i = 0; i < model->rowCount(); ++i) {
-            QStandardItem* checkItem = model->item(i, 7);
+            QStandardItem* checkItem = model->item(i, 8);  // 第8列是选择框
             if (checkItem && checkItem->checkState() == Qt::Checked) {
                 selectedRows.append(i);
             }
         }
 
         if (selectedRows.isEmpty()) {
-            QMessageBox::warning(this, "警告", "没有选中任何记录，将导出全部记录");
+            QMessageBox::warning(this, "警告", "没有选中任何记录，将导出当前表单全部记录");
             startExportOperation(fileName, exportEncrypted);
         } else {
             startExportSelectedOperation(fileName, selectedRows, exportEncrypted);
@@ -1194,6 +1348,8 @@ void MainWindow::importPasswords()
 
 void MainWindow::startImportOperation(const QString &filename)
 {
+    qDebug() << "开始导入操作，文件:" << filename << "当前表单ID:" << currentFormId;
+
     operationInProgress = true;
 
     // 禁用相关按钮
@@ -1210,6 +1366,7 @@ void MainWindow::startImportOperation(const QString &filename)
     worker = new ImportExportWorker();
     worker->setOperationType(ImportExportWorker::ImportOperation);
     worker->setFilename(filename);
+    worker->setFormId(currentFormId);  // 导入到当前表单
     worker->moveToThread(workerThread);
 
     // 连接信号
@@ -1231,6 +1388,8 @@ void MainWindow::startImportOperation(const QString &filename)
 
 void MainWindow::startExportOperation(const QString &filename, bool exportEncrypted)
 {
+    qDebug() << "开始导出操作，文件:" << filename << "导出类型:" << exportEncrypted << "当前表单ID:" << currentFormId;
+
     operationInProgress = true;
 
     // 禁用相关按钮
@@ -1248,6 +1407,7 @@ void MainWindow::startExportOperation(const QString &filename, bool exportEncryp
     worker->setOperationType(ImportExportWorker::ExportOperation);
     worker->setFilename(filename);
     worker->setExportEncrypted(exportEncrypted);  // 设置导出类型
+    worker->setFormId(currentFormId);  // 导出当前表单
     worker->moveToThread(workerThread);
 
     // 连接信号
@@ -1270,6 +1430,9 @@ void MainWindow::startExportOperation(const QString &filename, bool exportEncryp
 
 void MainWindow::startExportSelectedOperation(const QString &filename, const QList<int> &selectedRows, bool exportEncrypted)
 {
+    qDebug() << "开始导出选中记录操作，文件:" << filename << "导出类型:" << exportEncrypted
+             << "选中行数:" << selectedRows.size() << "当前表单ID:" << currentFormId;
+
     operationInProgress = true;
 
     // 禁用相关按钮
@@ -1288,6 +1451,7 @@ void MainWindow::startExportSelectedOperation(const QString &filename, const QLi
     worker->setFilename(filename);
     worker->setSelectedRows(selectedRows);
     worker->setExportEncrypted(exportEncrypted);  // 设置导出类型
+    worker->setFormId(currentFormId);  // 导出当前表单
     worker->moveToThread(workerThread);
 
     // 连接信号
@@ -1328,6 +1492,8 @@ void MainWindow::onExportProgress(int percent, const QString &message)
 
 void MainWindow::onOperationFinished(bool success, const QString &message)
 {
+    qDebug() << "操作完成，成功:" << success << "消息:" << message;
+
     operationInProgress = false;
 
     // 启用按钮
@@ -1363,6 +1529,8 @@ void MainWindow::onOperationFinished(bool success, const QString &message)
 
 void MainWindow::onOperationError(const QString &error)
 {
+    qDebug() << "操作错误:" << error;
+
     operationInProgress = false;
 
     // 启用按钮
@@ -1429,6 +1597,12 @@ void MainWindow::testDatabase()
     if (Database::instance().init()) {
         QMessageBox::information(this, "数据库测试", "数据库连接成功！");
         statusBar->showMessage("数据库连接正常");
+
+        // 测试是否可以获取表单
+        auto forms = Database::instance().getAllForms();
+        qDebug() << "数据库测试: 表单数量:" << forms.size();
+        QMessageBox::information(this, "数据库测试",
+                                 QString("数据库连接成功！\n表单数量: %1").arg(forms.size()));
     } else {
         QMessageBox::warning(this, "数据库测试", "数据库连接失败！");
         statusBar->showMessage("数据库连接失败");
@@ -1438,9 +1612,13 @@ void MainWindow::testDatabase()
 void MainWindow::showAbout()
 {
     QMessageBox::about(this, "关于密码管理器",
-                       "个人密码管理器 v1.4（账号增强版）\n\n"
+                       "个人密码管理器 v2.0（表单增强版）\n\n"
                        "基于Qt开发的密码管理工具\n"
                        "新增功能：\n"
+                       "  • 表单管理：可创建多个表单组织密码\n"
+                       "  • 表单切换：类似WPS的标签页界面\n"
+                       "  • 表单搜索：可选择在特定表单中搜索\n"
+                       "  • 表单操作：添加、删除、重命名表单\n"
                        "  • 增加账号字段（6-20位）\n"
                        "  • 账号和密码格式验证\n"
                        "  • 账号加密存储\n"
@@ -1451,4 +1629,107 @@ void MainWindow::showAbout()
                        "  • 导出保密版/未保密版选择\n"
                        "  • 密码加密存储与导出\n\n"
                        "课程设计项目 - Qt应用程序开发");
+}
+
+// 表单相关槽函数
+void MainWindow::onFormAdded(int id, const QString &name)
+{
+    qDebug() << "表单添加请求，ID:" << id << "名称:" << name;
+
+    if (id == -1) {
+        // 新表单，需要创建
+        if (Database::instance().addForm(name)) {
+            // 重新加载表单
+            auto forms = Database::instance().getAllForms();
+            formTabWidget->clear();  // 使用clear()函数
+            for (const auto &form : forms) {
+                formTabWidget->addForm(form.id, form.name, form.name == name);
+                if (form.name == name) {
+                    currentFormId = form.id;
+                }
+            }
+            loadPasswords();
+            statusBar->showMessage(QString("表单 '%1' 添加成功").arg(name));
+            QMessageBox::information(this, "成功", QString("表单 '%1' 添加成功").arg(name));
+        } else {
+            QMessageBox::warning(this, "失败", "表单添加失败");
+        }
+    }
+}
+
+void MainWindow::onFormRemoved(int id)
+{
+    qDebug() << "表单删除请求，ID:" << id;
+
+    if (Database::instance().deleteForm(id)) {
+        // 重新加载表单
+        auto forms = Database::instance().getAllForms();
+        formTabWidget->clear();  // 使用clear()函数
+        if (!forms.isEmpty()) {
+            for (const auto &form : forms) {
+                formTabWidget->addForm(form.id, form.name, form.id == forms.first().id);
+                if (form.id == forms.first().id) {
+                    currentFormId = form.id;
+                }
+            }
+        } else {
+            currentFormId = -1;
+        }
+        loadPasswords();
+        statusBar->showMessage("表单删除成功");
+        QMessageBox::information(this, "成功", "表单删除成功");
+    } else {
+        QMessageBox::warning(this, "失败", "表单删除失败");
+    }
+}
+
+void MainWindow::onFormRenamed(int id, const QString &newName)
+{
+    qDebug() << "表单重命名请求，ID:" << id << "新名称:" << newName;
+
+    if (Database::instance().updateForm(id, newName)) {
+        formTabWidget->updateForm(id, newName);
+        statusBar->showMessage(QString("表单重命名为 '%1'").arg(newName));
+    } else {
+        QMessageBox::warning(this, "失败", "表单重命名失败");
+    }
+}
+
+void MainWindow::onCurrentFormChanged(int id)
+{
+    qDebug() << "当前表单改变，新ID:" << id;
+
+    currentFormId = id;
+    loadPasswords();
+}
+
+void MainWindow::onFormSelectionChanged(const QList<int> &selectedIds)
+{
+    selectedFormIdsForSearch = selectedIds;
+    if (selectedIds.isEmpty()) {
+        statusBar->showMessage("未选择任何表单，将在所有表单中搜索");
+        selectedFormIdsForSearch = formTabWidget->allFormIds();
+    } else {
+        statusBar->showMessage(QString("已选择 %1 个表单进行搜索").arg(selectedIds.size()));
+    }
+}
+
+void MainWindow::onSelectFormsClicked()
+{
+    // 获取所有表单信息
+    auto forms = Database::instance().getAllForms();
+    QList<int> formIds;
+    QList<QString> formNames;
+
+    for (const auto &form : forms) {
+        formIds.append(form.id);
+        formNames.append(form.name);
+    }
+
+    // 创建并显示对话框
+    FormSelectDialog dialog(formIds, formNames, selectedFormIdsForSearch, this);
+    if (dialog.exec() == QDialog::Accepted) {
+        QList<int> selectedIds = dialog.selectedFormIds();
+        formTabWidget->setSelectedForms(selectedIds);
+    }
 }
