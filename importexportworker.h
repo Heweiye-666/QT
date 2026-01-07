@@ -8,7 +8,7 @@
 #include <QSqlQuery>
 #include "database.h"
 
-class ImportExportWorker : public QObject
+              class ImportExportWorker : public QObject
 {
     Q_OBJECT
 
@@ -25,6 +25,7 @@ public:
     void setFilename(const QString &filename) { m_filename = filename; }
     void setSelectedRows(const QList<int> &selectedRows) { m_selectedRows = selectedRows; }
     void setExportEncrypted(bool encrypted) { m_exportEncrypted = encrypted; }
+    void setFormId(int formId) { m_formId = formId; }  // 新增
 
 public slots:
     void startOperation();
@@ -39,6 +40,7 @@ private:
     QString m_filename;
     QList<int> m_selectedRows;
     bool m_exportEncrypted;
+    int m_formId;  // 新增
 
     bool importFromCSV();
     bool exportToCSV();
@@ -46,3 +48,4 @@ private:
 };
 
 #endif // IMPORTEXPORTWORKER_H
+
