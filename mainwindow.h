@@ -16,10 +16,13 @@
 #include <QHeaderView>
 #include <QCheckBox>
 #include <QThread>
+#include <QToolButton>
 
 // 前向声明
 class ImportExportWorker;
-class QProgressDialog;  // 前向声明，不包含头文件
+class FormTabWidget;
+class FormSelectDialog;
+class QProgressDialog;
 
 class MainWindow : public QMainWindow
 {
@@ -44,6 +47,14 @@ private slots:
     void onTableViewClicked(const QModelIndex &index);
     void onItemDoubleClicked(const QModelIndex &index);
 
+    // 表单相关槽函数
+    void onFormAdded(int id, const QString &name);
+    void onFormRemoved(int id);
+    void onFormRenamed(int id, const QString &newName);
+    void onCurrentFormChanged(int id);
+    void onFormSelectionChanged(const QList<int> &selectedIds);
+    void onSelectFormsClicked();
+
     // 多线程操作槽函数
     void onImportProgress(int percent, const QString &message);
     void onExportProgress(int percent, const QString &message);
@@ -53,6 +64,7 @@ private slots:
 
 private:
     void setupUI();
+    void loadForms();
     void loadPasswords();
     void setupTable();
     bool exportSelectedPasswords(const QString &filename);
@@ -62,7 +74,7 @@ private:
     bool editField(int row, int column);
     void updateSelectAllButtonText();
     void clearAllCheckboxes();
-    void createProgressDialog();  // 改为创建函数，而不是在构造函数中创建
+    void createProgressDialog();
 
     // 多线程操作方法
     void startImportOperation(const QString &filename);
@@ -77,11 +89,16 @@ private:
     QPushButton *showPasswordButton;
     QPushButton *multiSelectButton;
     QPushButton *selectAllButton;
+    QToolButton *selectFormsButton;  // 新增：选择表单按钮
+
+    // 表单标签栏
+    FormTabWidget *formTabWidget;
+
     QMenuBar *menuBar;
     QStatusBar *statusBar;
 
     // 多线程相关成员
-    QProgressDialog *progressDialog;  // 仅在需要时创建
+    QProgressDialog *progressDialog;
     QThread *workerThread;
     ImportExportWorker *worker;
     bool operationInProgress;
@@ -89,6 +106,10 @@ private:
     bool multiSelectMode;
     int lastSelectedRow;
     bool isAllSelected;
+
+    // 当前选中的表单ID列表（用于搜索）
+    QList<int> selectedFormIdsForSearch;
+    int currentFormId;  // 当前激活的表单ID
 };
 
 #endif // MAINWINDOW_H
